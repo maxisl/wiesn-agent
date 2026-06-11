@@ -24,8 +24,8 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ src/
 RUN pip install --no-cache-dir uv \
-    && uv pip install --system ".[web]" \
-    && playwright install chromium
+    && uv pip install --system --prerelease=allow ".[web]" \
+    && playwright install --with-deps chromium
 
 # Copy built frontend from stage 1
 COPY --from=frontend /app/web/dist web/dist

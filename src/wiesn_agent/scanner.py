@@ -13,9 +13,12 @@ Used by:
 
 from __future__ import annotations
 
+import asyncio
+import html as html_lib
 import json
 import logging
 import re
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -128,7 +131,17 @@ def save_snapshots(snapshots: dict[str, PortalSnapshot]) -> None:
 EXTRACT_SELECTS_JS = """() => {
     const result = {datum: [], uhrzeiten: [], bereiche: [], tischgroessen: [], portal_type: 'unknown'};
 
-    const selects = [...document.querySelectorAll('select')].filter(el => el.offsetParent !== null);
+    // Festzelt OS (Filament + Choices.js) hides the native <select> behind a
+    // styled widget, so a visible-only filter misses the date dropdown.
+    // Detect that platform via its meta tag / Filament classes and, for it,
+    // include hidden selects too.
+    const appName = (document.querySelector('meta[name="application-name"]') || {}).content || '';
+    const isFestzeltOS = appName.includes('Festzelt OS')
+        || !!document.querySelector('[class*="fi-fo-"]');
+    const allSelects = [...document.querySelectorAll('select')];
+    const selects = isFestzeltOS
+        ? allSelects
+        : allSelects.filter(el => el.offsetParent !== null);
 
     // Heuristic: First select = date, second = time, third = area/table size
     // Additional label-based detection
@@ -175,7 +188,7 @@ EXTRACT_SELECTS_JS = """() => {
 
     // Portal type
     if ([...document.querySelectorAll('*')].find(el => el.hasAttribute('wire:id'))) result.portal_type = 'livewire';
-    else if (document.querySelector('.fi-fo-wizard')) result.portal_type = 'festzelt-os';
+    else if (isFestzeltOS) result.portal_type = 'festzelt-os';
     else if (selects.some(s => (s.name || '').includes('appvars'))) result.portal_type = 'ratskeller';
     else if (selects.length > 0) result.portal_type = 'select-portal';
     else result.portal_type = 'no-selects';
@@ -232,6 +245,90 @@ FIND_RESERVATION_LINK_JS = """() => {
 }"""
 
 
+# ═══════════════════════════════════════════════════
+# Festzelt OS — direct HTTP fetch (bypasses headless block)
+# ═══════════════════════════════════════════════════
+
+# Festzelt OS portals serve a stripped/challenge page to headless browsers,
+# but fully server-render the date dropdown for an ordinary HTTP request.
+# So for these portals we skip Playwright and read the date <option>s straight
+# from the HTML — no automation fingerprint to detect, and lighter on the portal.
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+_OPTION_RE = re.compile(
+    r'<option\b[^>]*?\bvalue=(["\'])(?P<value>.*?)\1[^>]*?>(?P<text>.*?)</option>',
+    re.IGNORECASE | re.DOTALL,
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+_DATE_RE = re.compile(
+    r"\d{1,2}[./]\d{1,2}[./]\d{4}|september|oktober|october",
+    re.IGNORECASE,
+)
+
+
+def _fetch_html(url: str, timeout: int = 20) -> str | None:
+    """Plain HTTP GET with a browser-like User-Agent. Returns HTML or None."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return resp.read().decode(charset, "replace")
+    except Exception as e:
+        logger.warning(f"  → HTTP fetch failed for {url}: {e}")
+        return None
+
+
+def parse_festzelt_os_dates(page_html: str) -> list[dict] | None:
+    """Parse Festzelt OS date <option>s from raw HTML.
+
+    Returns a list of {value, text} date options, or None if the page is not a
+    Festzelt OS portal (so the caller falls back to the browser path).
+    """
+    if "Festzelt OS" not in page_html and "fi-fo-" not in page_html:
+        return None
+
+    dates: list[dict] = []
+    seen: set[str] = set()
+    for m in _OPTION_RE.finditer(page_html):
+        value = m.group("value").strip()
+        if not value:
+            continue  # skip the "Wählen Sie eine Option" placeholder
+        text = html_lib.unescape(_TAG_RE.sub("", m.group("text"))).strip()
+        if not _DATE_RE.search(text):
+            continue  # keep only date-like options
+        if value in seen:
+            continue
+        seen.add(value)
+        dates.append({"value": value, "text": text})
+    return dates
+
+
+async def fetch_festzelt_os_snapshot(portal: PortalConfig) -> PortalSnapshot | None:
+    """Return a snapshot via HTTP if `portal` is a Festzelt OS portal, else None.
+
+    The blocking HTTP fetch runs in a thread so it never stalls the event loop.
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    loop = asyncio.get_event_loop()
+    page_html = await loop.run_in_executor(None, _fetch_html, portal.url)
+    if page_html is None:
+        return None
+    dates = parse_festzelt_os_dates(page_html)
+    if dates is None:
+        return None
+    logger.info(f"  → Festzelt OS portal (HTTP): {len(dates)} dates")
+    return PortalSnapshot(
+        portal_name=portal.name,
+        portal_url=portal.url,
+        timestamp=now,
+        datum_options=dates,
+        portal_type="festzelt-os-http",
+    )
+
+
 async def scan_portal_availability(page: Page, portal: PortalConfig, timeout: int = 30000) -> PortalSnapshot:
     """Scan a portal and return a snapshot of available dates.
 
@@ -240,6 +337,13 @@ async def scan_portal_availability(page: Page, portal: PortalConfig, timeout: in
     links to an external or separate booking system).
     """
     now = datetime.now().isoformat(timespec="seconds")
+
+    # Festzelt OS portals block headless browsers — read them over plain HTTP
+    # first; non-Festzelt-OS portals return None here and fall through to the
+    # browser path below unchanged.
+    festzelt_snapshot = await fetch_festzelt_os_snapshot(portal)
+    if festzelt_snapshot is not None:
+        return festzelt_snapshot
 
     try:
         await page.goto(portal.url, wait_until="domcontentloaded", timeout=timeout)
@@ -606,4 +710,3 @@ def filter_relevant_changes(change: AvailabilityChange, config: WiesnConfig) -> 
         is_first_scan=change.is_first_scan,
         deep_scan_results=change.deep_scan_results,
     )
-

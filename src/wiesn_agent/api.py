@@ -252,7 +252,7 @@ async def _scan_portals(portals: list, config: WiesnConfig) -> list[dict]:
                             portal.name, len(matching_dates), new_snap.portal_type,
                             portal=portal.name,
                         )
-                    if matching_dates and new_snap.portal_type not in ("no-selects", "error"):
+                    if matching_dates and new_snap.portal_type not in ("no-selects", "error", "festzelt-os-http"):
                         for datum in matching_dates:
                             try:
                                 ds = await deep_scan_date(
@@ -305,6 +305,8 @@ async def _scan_portals(portals: list, config: WiesnConfig) -> list[dict]:
                         "portal": portal.name,
                         "dates_found": len(new_snap.datum_options),
                         "new_dates": len(change.new_dates),
+                        "new_date_list": change.new_dates,
+                        "is_first_scan": change.is_first_scan,
                         "portal_type": new_snap.portal_type,
                         "error": new_snap.error,
                         "summary": change.summary(),
@@ -516,6 +518,93 @@ async def _flush_quiet_hours_digest(config: WiesnConfig) -> None:
     _save_alert_state()
 
 
+async def _notify_matching_dates(results: list[dict], config: WiesnConfig) -> None:
+    """Notify when a NEW date matching wunsch_tage appears — regardless of time.
+
+    This is the date-level (Thursday–Saturday) alert: it fires for any newly
+    appeared date in the user's wunsch_tage, whether or not evening time slots
+    have been confirmed. Evening-specific alerting is handled separately by
+    _notify_new_evening_slots() and is deferred for now.
+
+    Dedupe is handled by the snapshot diff: change.new_dates only contains dates
+    new since the previous scan, so each date alerts exactly once. First-scan
+    (baseline) results are skipped so we never dump pre-existing dates as alerts.
+    """
+    import json as _json
+
+    from wiesn_agent.tools.notify_tools import send_notification, should_notify_now
+
+    push_allowed = should_notify_now(config.notifications)
+    snapshots = load_snapshots()
+
+    for r in results:
+        if r.get("error") or r.get("is_first_scan"):
+            continue
+        portal_name = r["portal"]
+        matching = [
+            d for d in r.get("new_date_list", [])
+            if matches_wunsch(d.get("text", d.get("value", "")), config)
+        ]
+        if not matching:
+            continue
+
+        snap = snapshots.get(portal_name)
+        booking_url = snap.portal_url if snap else ""
+        dates_str = ", ".join(d.get("text", d.get("value", "")) for d in matching[:5])
+
+        # Always record a web alert (independent of quiet hours)
+        _push_slot_alert(portal_name, dates_str, "Zeit noch offen", booking_url)
+
+        push_status = "skipped_quiet_hours"
+        if push_allowed:
+            title = f"Neuer Termin: {portal_name}"
+            message = (
+                f"{portal_name}\n"
+                f"📅 {dates_str}\n"
+                f"\n→ Prüfen & buchen: {booking_url}"
+            )
+            for attempt in range(3):
+                result_json = await send_notification(
+                    title=title,
+                    message=message,
+                    config=config.notifications,
+                    notify_type="success",
+                    event_type="new_date",
+                )
+                try:
+                    push_status = _json.loads(result_json).get("status", "unknown")
+                except (ValueError, TypeError):
+                    push_status = "error"
+                if push_status in ("sent", "partial"):
+                    break
+                if attempt < 2:
+                    logger.warning(
+                        "Date push failed (attempt %d/3) for %s, retrying...",
+                        attempt + 1, portal_name,
+                    )
+                    await asyncio.sleep(2 ** attempt)
+        else:
+            _quiet_hours_queue.append({
+                "portal": portal_name,
+                "date": dates_str,
+                "times": "Zeit noch offen",
+                "url": booking_url,
+                "queued_at": datetime.now().isoformat(),
+            })
+            push_status = "queued_quiet_hours"
+
+        _log_activity(
+            "info",
+            "New matching date: %s on %s (push: %s)",
+            portal_name, dates_str, push_status,
+            portal=portal_name, event="date_alert",
+        )
+        audit_log("date_alert", f"{portal_name}: {dates_str} ({push_status})",
+                  portal=portal_name, datum=dates_str, push_status=push_status)
+
+    _save_alert_state()
+
+
 async def _background_scanner() -> None:
     """Periodically scan all enabled portals in the background."""
     # Wait a few seconds before first scan so the server is fully up
@@ -545,8 +634,11 @@ async def _background_scanner() -> None:
             audit_log("scan_complete", f"{len(portals)} portals, {new_count} new dates",
                       portals=len(portals), new_dates=new_count)
 
-            # Send notifications for portals with new evening slots
-            await _notify_new_evening_slots(results, config)
+            # Date-level alerts: fire for any new wunsch_tage (Thu–Sat) date,
+            # regardless of time. Evening-only alerting is deferred until reliable
+            # evening detection (incl. Festzelt OS over HTTP) is built.
+            await _notify_matching_dates(results, config)
+            # await _notify_new_evening_slots(results, config)  # re-enable later
         except Exception as e:
             _log_activity("error", "Background scan failed: %s", e)
             audit_log("scan_error", str(e))
@@ -1316,6 +1408,11 @@ async def trigger_scan(portal_name: str):
             raise HTTPException(404, f"Portal '{portal_name}' not found")
 
     results = await _scan_portals(portals, config)
+
+    # Fire date-level alerts for manual scans too, so the Scan button is testable
+    # and useful — not just the background loop. Snapshot-diff dedupe prevents
+    # double notifications across manual and background scans.
+    await _notify_matching_dates(results, config)
 
     return {"results": results, "scanned": len(results)}
 
